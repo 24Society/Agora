@@ -1,3 +1,4 @@
+import json
 import threading
 from datetime import datetime
 from os import remove, path, mkdir
@@ -10,8 +11,8 @@ from typing import Any
 from dev_helper import *
 from encrypt import *
 
-minCompatibleClient = to_dict(open('minCompatibleClient.dat', 'r', encoding='utf-8').read())
-latestClient = to_dict(open('latestClient.dat', 'r', encoding='utf-8').read())
+with open('version.json', 'r') as f:
+    versions = json.load(f)
 default_user = open('userData\\default', 'r', encoding='utf-8').read()
 
 
@@ -297,7 +298,7 @@ def broadcast(message, group):
         if (i.data['username'] in member or public) and i.user_socket is not None:
             client = i.user_socket
             try:
-                client.send((f"message " + message).encode('utf-8'))
+                client.send(f"message {message}".encode('utf-8'))
             except ConnectionResetError:
                 i.user_socket = None
                 client.close()
@@ -328,21 +329,22 @@ def start_shell():
     return proc
 
 
-def handle_client(_client_socket, _addr):
+def handle_client(_client_socket: socket, _addr):
     _client_socket.setsockopt(SOL_SOCKET, SO_SNDBUF, 1024)
     now = User()
     shell = Popen
     print(f"[新连接] {_addr}")
     recv = _client_socket.recv(1024).decode("utf-8")
     client_data = to_dict(recv)
-    if client_data['ver'] < minCompatibleClient['ver']:
+    if client_data['ver'] < versions['minCompatibleClient']:
         _client_socket.send(
-            f'refused 版本{client_data['ver']}过旧\n请至少更新到{minCompatibleClient['ver']}'.encode('utf-8'))
+            f'refused 版本{client_data['ver']}过旧\n请至少更新到{versions['minCompatibleClient']}'.encode('utf-8'))
     else:
         _client_socket.send('ok'.encode('utf-8'))
     while True:
         try:
             message = recv_f(_client_socket)
+            # print(message)
             if now.data['user_type'] != 'player':
                 if now.data['user_type'] == 'admin':
                     if message['cmd'] == 'cmd':
@@ -377,11 +379,19 @@ def handle_client(_client_socket, _addr):
                                     _client_socket.send('refused 密码不能为空'.encode('utf-8'))
                                     break
                                 elif encrypt(message['opt'][1], message['opt'][0]) != i.data['pwd']:
+                                    # print(encrypt(message['opt'][1], message['opt'][0]), i.data['pwd'])
                                     _client_socket.send('refused 用户名或密码错误'.encode('utf-8'))
                                     break
-                            if i.user_socket is not None:
-                                _client_socket.send('refused 此用户已在某处登录'.encode('utf-8'))
+                                now.orig_pwd = message['opt'][1]
+                            elif encrypt(i.data['pwd'], _addr[0]) != message['opt'][1]:
+                                _client_socket.send('refused 记住密码状态已失效'.encode('utf-8'))
+                                i.set_remember()
                                 break
+                            if i.user_socket is not None:
+                                i.user_socket.send(f'echo !!!您在 {_addr} 登录!!!'.encode('utf-8'))
+                                i.user_socket.close()
+                                # _client_socket.send('refused 此用户已在某处登录'.encode('utf-8'))
+                                # break
                             i.user_socket = _client_socket
                             now = i
                             if now.data['user_type'] == 'admin':
@@ -395,7 +405,6 @@ def handle_client(_client_socket, _addr):
                                     if b"__END__" in line:
                                         shell.stdout.readline()
                                         break
-                            now.orig_pwd = message['opt'][1]
                             _client_socket.send(('ok ' + str(now)).encode('utf-8'))
                             break
                     else:
@@ -430,7 +439,7 @@ def handle_client(_client_socket, _addr):
                         _client_socket.send(f'ok {tmp_id} {str(now)}'.encode('utf-8'))
                     continue
                 if message['cmd'] == 'check':
-                    _client_socket.send(f'info {latestClient['ver']}'.encode('utf-8'))
+                    _client_socket.send(f'info {versions['latestClient']}'.encode('utf-8'))
                     continue
                 if message['cmd'] == 'history':
                     gp = message['opt'][0]
@@ -455,6 +464,14 @@ def handle_client(_client_socket, _addr):
                     if len(message['opt'][0]) < 2 or len(message['opt'][0]) > 30:
                         _client_socket.send('refused 用户名长度须在2~30间'.encode('utf-8'))
                         continue
+                    if now.data['remember_me']:
+                        if message['opt'][1] == '':
+                            _client_socket.send('refused 密码不能为空'.encode('utf-8'))
+                            continue
+                        elif encrypt(message['opt'][1], now.data['username']) != now.data['pwd']:
+                            _client_socket.send('refused 密码错误'.encode('utf-8'))
+                            continue
+                        now.orig_pwd = message['opt'][1]
                     for j in userList:
                         if message['opt'][0] == j.data['username']:
                             _client_socket.send('refused 此用户名已被占用'.encode('utf-8'))
@@ -480,6 +497,8 @@ def handle_client(_client_socket, _addr):
                         _client_socket.send(('info ' + str(groupList[message['opt'][1]].data)).encode('utf-8'))
                     continue
                 if message['cmd'] == 'remember':
+                    if not now.data['remember_me']:
+                        _client_socket.send(f'ok {encrypt(now.data['pwd'], _addr[0])}'.encode('utf-8'))
                     now.set_remember()
                     continue
                 if message['cmd'] == 'show_uid':
@@ -536,7 +555,7 @@ def handle_client(_client_socket, _addr):
                     groupList[message['opt'][0]].del_member(now.data['username'])
                     _client_socket.send('ok'.encode('utf-8'))
                     continue
-                if message['cmd'] == 'cancel':
+                if message['cmd'] == 'delete':
                     if now.data['user_type'] == 'admin':
                         _client_socket.send('refused 管理员不可注销账号'.encode('utf-8'))
                         continue
@@ -580,81 +599,54 @@ def handle_client(_client_socket, _addr):
                     continue
                 if message['cmd'] == 'get_file':
                     if message['opt'][0] == 'admin' and now.data['user_type'] == 'admin':
-                        if not path.exists(message['msg']):
-                            _client_socket.send('refused 此文件不存在'.encode('utf-8'))
-                            continue
-                        _client_socket.send(f'file {path.getsize(message['msg'])}'.encode('utf-8'))
-                        _client_socket.setblocking(False)
-                        while True:
-                            try:
-                                _client_socket.settimeout(0.1)
-                                tmp = _client_socket.recv(1024).decode("utf-8")
-                                if tmp == 'ok':
-                                    break
-                            except error or timeout:
-                                break
-                        _client_socket.setblocking(True)
-                        _client_socket.send(open(message['msg'], 'rb').read())
-                        continue
-                    if message['opt'][0] == 'user':
+                        f_path = message['msg']
+                    elif message['opt'][0] == 'user':
                         f_path = f'files\\{message['opt'][1]}\\{message['msg']}'
-                        if not path.exists(f_path):
-                            _client_socket.send('refused 此文件不存在'.encode('utf-8'))
-                            continue
-                        _client_socket.send(f'file {path.getsize(f_path)}'.encode('utf-8'))
-                        flag = False
-                        _client_socket.setblocking(False)
-                        while True:
-                            try:
-                                _client_socket.settimeout(1)
-                                tmp = _client_socket.recv(1024).decode("utf-8")
-                                if tmp == 'ok':
-                                    flag = True
-                                    break
-                            except error or timeout:
-                                break
-                        _client_socket.setblocking(True)
-                        if flag:
-                            _client_socket.send(open(f_path, 'rb').read())
+                    else:
+                        _client_socket.send('refused 拒绝访问'.encode('utf-8'))
                         continue
-                    _client_socket.send('refused 拒绝访问'.encode('utf-8'))
+                    if not path.exists(f_path):
+                        _client_socket.send('refused 此文件不存在'.encode('utf-8'))
+                        continue
+                    _client_socket.send(f'file {path.getsize(f_path)}'.encode('utf-8'))
+                    flag = False
+                    _client_socket.setblocking(False)
+                    while True:
+                        try:
+                            _client_socket.settimeout(1)
+                            tmp = _client_socket.recv(1024)
+                            if tmp == b'ok':
+                                flag = True
+                                break
+                        except error or timeout:
+                            break
+                    _client_socket.setblocking(True)
+                    if flag:
+                        _client_socket.send(open(f_path, 'rb').read())
                     continue
                 if message['cmd'] == 'upload_file':
                     if message['opt'][0] == 'admin' and now.data['user_type'] == 'admin':
                         _client_socket.send('ready'.encode('utf-8'))
                         f = open(message['msg'], 'wb')
-                        _client_socket.setblocking(False)
-                        while True:
-                            try:
-                                _client_socket.settimeout(0.5)
-                                more = _client_socket.recv(4096)
-                                if more == b'':
-                                    break
-                                f.write(more)
-                            except error or timeout:
-                                break
-                        _client_socket.setblocking(True)
-                        f.close()
-                        _client_socket.send('ok'.encode('utf-8'))
-                        continue
-                    if message['opt'][0] == 'user':
+                    elif message['opt'][0] == 'user':
                         _client_socket.send('ready'.encode('utf-8'))
                         f = open(f'files\\{message['opt'][1]}\\{message['msg']}', 'wb')
-                        _client_socket.setblocking(False)
-                        while True:
-                            try:
-                                _client_socket.settimeout(0.5)
-                                more = _client_socket.recv(4096)
-                                if more == b'':
-                                    break
-                                f.write(more)
-                            except error or timeout:
-                                break
-                        _client_socket.setblocking(True)
-                        f.close()
-                        _client_socket.send('ok'.encode('utf-8'))
+                    else:
+                        _client_socket.send('refused 拒绝访问'.encode('utf-8'))
                         continue
-                    _client_socket.send('refused 拒绝访问'.encode('utf-8'))
+                    _client_socket.setblocking(False)
+                    while True:
+                        try:
+                            _client_socket.settimeout(0.5)
+                            more = _client_socket.recv(4096)
+                            if more == b'':
+                                break
+                            f.write(more)
+                        except error or timeout:
+                            break
+                    _client_socket.setblocking(True)
+                    f.close()
+                    _client_socket.send('ok'.encode('utf-8'))
                     continue
             if message['cmd'] == 'game_join':
                 now.data['username'] = message['opt'][0]
@@ -682,7 +674,7 @@ def handle_client(_client_socket, _addr):
                 continue
         except KeyError:
             break
-        except ConnectionResetError:
+        except (ConnectionResetError, ConnectionAbortedError):
             break
     print(f"[断开连接] {_addr}")
     now.user_socket = None
